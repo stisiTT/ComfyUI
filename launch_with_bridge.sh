@@ -591,7 +591,7 @@ launch_comfyui() {
         --port "${COMFYUI_PORT}"
         --listen "${COMFYUI_LISTEN}"
         --tenstorrent
-        --bridge-socket "${SOCKET_PATH}"
+        --tt-socket "${SOCKET_PATH}"
     )
 
     # Display banner
