@@ -404,3 +404,461 @@ class TT_UnloadModel:
             # Don't raise - unload failures shouldn't break the workflow
 
         return ()
+
+
+class TT_Denoise:
+    """
+    Run denoising on Tenstorrent hardware, returning latents.
+
+    This node performs CLIP encoding and UNet denoising but does NOT run
+    VAE decode. Output latents can be passed to TT_VAEDecode or standard
+    VAEDecode for final image generation.
+
+    Supports both txt2img and img2img workflows.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {
+                    "tooltip": "Model from TT_CheckpointLoader"
+                }),
+                "positive": ("CONDITIONING", {
+                    "tooltip": "Positive conditioning (from CLIPTextEncode)"
+                }),
+                "negative": ("CONDITIONING", {
+                    "tooltip": "Negative conditioning (from CLIPTextEncode)"
+                }),
+                "seed": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 0xffffffffffffffff,
+                    "tooltip": "Random seed for reproducibility"
+                }),
+                "steps": ("INT", {
+                    "default": 20,
+                    "min": 1,
+                    "max": 150,
+                    "step": 1,
+                    "tooltip": "Number of denoising steps"
+                }),
+                "cfg": ("FLOAT", {
+                    "default": 5.0,
+                    "min": 0.0,
+                    "max": 30.0,
+                    "step": 0.1,
+                    "tooltip": "Classifier-Free Guidance scale"
+                }),
+                "guidance_rescale": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Guidance rescale factor (0.0 = disabled)"
+                }),
+            },
+            "optional": {
+                "latent_image": ("LATENT", {
+                    "tooltip": "Input latents for img2img (optional)"
+                }),
+                "denoise": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Denoise strength (1.0 = full denoise, <1.0 = img2img)"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("samples",)
+    OUTPUT_TOOLTIPS = ("Denoised latent tensors",)
+    FUNCTION = "denoise"
+    CATEGORY = "Tenstorrent/sampling"
+    DESCRIPTION = "Run CLIP encoding and UNet denoising on Tenstorrent hardware, returns latent tensors"
+
+    def denoise(self, model, positive, negative, seed, steps, cfg,
+                guidance_rescale, latent_image=None, denoise=1.0) -> Tuple:
+        """
+        Execute denoising operation on Tenstorrent hardware.
+
+        Args:
+            model: TTModelWrapper from TT_CheckpointLoader
+            positive: Positive CONDITIONING from CLIPTextEncode
+            negative: Negative CONDITIONING from CLIPTextEncode
+            seed: Random seed for latent generation
+            steps: Number of denoising steps
+            cfg: Guidance scale
+            guidance_rescale: Guidance rescale factor
+            latent_image: Optional input latent for img2img (LATENT dict)
+            denoise: Denoise strength (1.0 = full denoise)
+
+        Returns:
+            Tuple containing LATENT dictionary with "samples" tensor
+        """
+        if not hasattr(model, 'model_id') or not hasattr(model, 'backend'):
+            raise RuntimeError(
+                "TT_Denoise requires a Tenstorrent model from TT_CheckpointLoader."
+            )
+
+        logger.info("=" * 80)
+        logger.info("TT_DENOISE - Starting denoising (returns latents)")
+        logger.info("=" * 80)
+        logger.info(f"Model: {model.model_id}")
+        logger.info(f"Steps: {steps}, CFG: {cfg}, Guidance rescale: {guidance_rescale}, Seed: {seed}")
+        logger.info(f"Denoise strength: {denoise}")
+
+        try:
+            import torch
+
+            backend = model.backend
+
+            # Extract conditioning data from ComfyUI CONDITIONING format
+            # CONDITIONING format: [(embedding_tensor, metadata_dict), ...]
+            # For text-based conditioning, we need to extract the prompts from metadata
+            # or pass the embeddings directly if they're pre-encoded
+
+            positive_text = None
+            negative_text = None
+
+            # Try to extract text from conditioning metadata
+            if isinstance(positive, list) and len(positive) > 0:
+                cond_data = positive[0]
+                if isinstance(cond_data, tuple) and len(cond_data) >= 2:
+                    metadata = cond_data[1]
+                    if isinstance(metadata, dict):
+                        # Check if this is text-based conditioning
+                        if "pooled_output" in metadata or "prompt" in metadata:
+                            positive_text = metadata.get("prompt", "")
+
+            if isinstance(negative, list) and len(negative) > 0:
+                cond_data = negative[0]
+                if isinstance(cond_data, tuple) and len(cond_data) >= 2:
+                    metadata = cond_data[1]
+                    if isinstance(metadata, dict):
+                        if "pooled_output" in metadata or "prompt" in metadata:
+                            negative_text = metadata.get("prompt", "")
+
+            # If we couldn't extract text, use default prompts
+            if positive_text is None:
+                logger.warning("Could not extract positive prompt from CONDITIONING, using placeholder")
+                positive_text = "a beautiful landscape"
+
+            if negative_text is None:
+                logger.warning("Could not extract negative prompt from CONDITIONING, using placeholder")
+                negative_text = "blurry, low quality"
+
+            logger.info(f"Positive prompt: {positive_text[:100]}...")
+            logger.info(f"Negative prompt: {negative_text[:100]}...")
+
+            # Prepare parameters for bridge server
+            params = {
+                "model_id": model.model_id,
+                "prompt": positive_text,
+                "negative_prompt": negative_text,
+                "num_inference_steps": steps,
+                "guidance_scale": cfg,
+                "seed": seed,
+            }
+
+            # Add guidance_rescale if non-zero
+            if guidance_rescale > 0.0:
+                params["guidance_rescale"] = guidance_rescale
+
+            # For SDXL, send same prompt as prompt_2 if not specified
+            if model.model_type == "sdxl":
+                params["prompt_2"] = positive_text
+                params["negative_prompt_2"] = negative_text
+
+            # Handle optional latent_image input for img2img
+            latents_shm = None
+            if latent_image is not None:
+                logger.info("Using provided latent_image for img2img")
+                latents = latent_image["samples"]
+                logger.info(f"Input latents shape: {latents.shape}, dtype: {latents.dtype}")
+
+                # Transfer to shared memory
+                latents_shm = backend.tensor_bridge.tensor_to_shm(latents)
+                params["latent_image_shm"] = latents_shm
+                params["denoise_strength"] = denoise
+
+            # Call bridge server for denoise_only operation
+            logger.info("Calling bridge server for denoise_only (CLIP + UNet, no VAE)...")
+
+            try:
+                response = backend._send_receive("denoise_only", params)
+
+                # Check response
+                if "latents_shm" not in response:
+                    raise RuntimeError(f"Bridge did not return latents_shm. Response keys: {list(response.keys())}")
+
+                # Deserialize latents from shared memory
+                latents = backend.tensor_bridge.tensor_from_shm(response["latents_shm"])
+
+                logger.info(f"Received latents: shape={latents.shape}, dtype={latents.dtype}")
+                logger.info(f"Latent value range: [{latents.min().item():.3f}, {latents.max().item():.3f}]")
+
+                # Return in ComfyUI LATENT format
+                # LATENT format: {"samples": tensor [B, C, H, W], "batch_index": [0, 1, ...]}
+                batch_size = latents.shape[0]
+                result = {
+                    "samples": latents,
+                    "batch_index": list(range(batch_size))
+                }
+
+                logger.info("=" * 80)
+                logger.info("TT_DENOISE - Complete! Latents ready for VAE decode")
+                logger.info("=" * 80)
+
+                return (result,)
+
+            finally:
+                # Clean up input shared memory if we created it
+                if latents_shm is not None:
+                    backend.tensor_bridge.cleanup_segment(latents_shm["shm_name"])
+
+        except Exception as e:
+            logger.error(f"Error in TT_Denoise: {e}", exc_info=True)
+            raise RuntimeError(f"TT_Denoise failed: {e}")
+
+
+class TT_VAEDecode:
+    """
+    Decode latent tensors to images using Tenstorrent VAE.
+
+    This node accepts LATENT tensors from TT_Denoise, standard KSampler,
+    or any other source and decodes them to pixel-space images using
+    the VAE on Tenstorrent hardware.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "samples": ("LATENT", {
+                    "tooltip": "Latent tensors from TT_Denoise or KSampler"
+                }),
+                "vae": ("VAE", {
+                    "tooltip": "VAE from TT_CheckpointLoader"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    OUTPUT_TOOLTIPS = ("Decoded images in [0, 1] range",)
+    FUNCTION = "decode"
+    CATEGORY = "Tenstorrent/latent"
+    DESCRIPTION = "Decode latent tensors to images using Tenstorrent VAE"
+
+    def decode(self, samples, vae) -> Tuple:
+        """
+        Decode latent tensors using Tenstorrent VAE.
+
+        Args:
+            samples: LATENT dictionary with "samples" tensor [B, C, H, W]
+            vae: TTVAEWrapper from TT_CheckpointLoader
+
+        Returns:
+            Tuple containing IMAGE tensor [B, H, W, C] in range [0, 1]
+        """
+        if not hasattr(vae, 'model_id') or not hasattr(vae, 'backend'):
+            raise RuntimeError(
+                "TT_VAEDecode requires a Tenstorrent VAE from TT_CheckpointLoader."
+            )
+
+        logger.info("=" * 80)
+        logger.info("TT_VAEDECODE - Starting VAE decode")
+        logger.info("=" * 80)
+        logger.info(f"VAE: {vae.model_id}")
+
+        try:
+            import torch
+
+            backend = vae.backend
+
+            # Extract latents from LATENT format
+            if not isinstance(samples, dict) or "samples" not in samples:
+                raise RuntimeError(
+                    f"TT_VAEDecode requires LATENT format with 'samples' key. "
+                    f"Got: {type(samples)}"
+                )
+
+            latents = samples["samples"]
+            logger.info(f"Input latents shape: {latents.shape}, dtype: {latents.dtype}")
+            logger.info(f"Latent value range: [{latents.min().item():.3f}, {latents.max().item():.3f}]")
+
+            # Transfer latents to shared memory
+            latents_shm = backend.tensor_bridge.tensor_to_shm(latents)
+
+            # Prepare parameters for bridge server
+            params = {
+                "model_id": vae.model_id,
+                "latents_shm": latents_shm,
+            }
+
+            # Call bridge server for vae_decode operation
+            logger.info("Calling bridge server for vae_decode...")
+
+            try:
+                response = backend._send_receive("vae_decode", params)
+
+                # Check response
+                if "images_shm" not in response:
+                    raise RuntimeError(f"Bridge did not return images_shm. Response keys: {list(response.keys())}")
+
+                # Deserialize images from shared memory
+                images = backend.tensor_bridge.tensor_from_shm(response["images_shm"])
+
+                logger.info(f"Received images: shape={images.shape}, dtype={images.dtype}")
+                logger.info(f"Image value range: [{images.min().item():.3f}, {images.max().item():.3f}]")
+
+                # Ensure correct format for ComfyUI: [B, H, W, C] in range [0, 1]
+                if images.ndim == 4:
+                    # Check if format is [B, C, H, W] and convert to [B, H, W, C]
+                    if images.shape[1] == 3 or images.shape[1] == 4:
+                        images = images.permute(0, 2, 3, 1)
+                        logger.info(f"Converted images to [B, H, W, C]: {images.shape}")
+
+                # Ensure range [0, 1]
+                if images.max() > 1.0:
+                    images = images / 255.0
+                    logger.info("Normalized images from [0, 255] to [0, 1]")
+
+                # Clamp to [0, 1] range
+                images = images.clamp(0.0, 1.0)
+
+                logger.info("=" * 80)
+                logger.info("TT_VAEDECODE - Complete!")
+                logger.info("=" * 80)
+
+                return (images,)
+
+            finally:
+                # Clean up input shared memory
+                backend.tensor_bridge.cleanup_segment(latents_shm["shm_name"])
+
+        except Exception as e:
+            logger.error(f"Error in TT_VAEDecode: {e}", exc_info=True)
+            raise RuntimeError(f"TT_VAEDecode failed: {e}")
+
+
+class TT_VAEEncode:
+    """
+    Encode images to latent tensors using Tenstorrent VAE.
+
+    This node accepts pixel-space images and encodes them to latent
+    tensors using the VAE on Tenstorrent hardware. Useful for img2img
+    workflows where you start from an existing image.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pixels": ("IMAGE", {
+                    "tooltip": "Input images from LoadImage or other source"
+                }),
+                "vae": ("VAE", {
+                    "tooltip": "VAE from TT_CheckpointLoader"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("samples",)
+    OUTPUT_TOOLTIPS = ("Encoded latent tensors",)
+    FUNCTION = "encode"
+    CATEGORY = "Tenstorrent/latent"
+    DESCRIPTION = "Encode images to latent tensors using Tenstorrent VAE"
+
+    def encode(self, pixels, vae) -> Tuple:
+        """
+        Encode images using Tenstorrent VAE.
+
+        Args:
+            pixels: IMAGE tensor [B, H, W, C] in range [0, 1] (ComfyUI format)
+            vae: TTVAEWrapper from TT_CheckpointLoader
+
+        Returns:
+            Tuple containing LATENT dictionary with "samples" tensor
+        """
+        if not hasattr(vae, 'model_id') or not hasattr(vae, 'backend'):
+            raise RuntimeError(
+                "TT_VAEEncode requires a Tenstorrent VAE from TT_CheckpointLoader."
+            )
+
+        logger.info("=" * 80)
+        logger.info("TT_VAEENCODE - Starting VAE encode")
+        logger.info("=" * 80)
+        logger.info(f"VAE: {vae.model_id}")
+
+        try:
+            import torch
+
+            backend = vae.backend
+
+            # Validate input format
+            if not isinstance(pixels, torch.Tensor):
+                raise RuntimeError(
+                    f"TT_VAEEncode requires IMAGE tensor input. Got: {type(pixels)}"
+                )
+
+            logger.info(f"Input images shape: {pixels.shape}, dtype: {pixels.dtype}")
+            logger.info(f"Image value range: [{pixels.min().item():.3f}, {pixels.max().item():.3f}]")
+
+            # ComfyUI IMAGE format is [B, H, W, C] in range [0, 1]
+            # Validate shape
+            if pixels.ndim != 4:
+                raise RuntimeError(
+                    f"TT_VAEEncode expects 4D image tensor [B, H, W, C]. Got shape: {pixels.shape}"
+                )
+
+            # Transfer images to shared memory
+            images_shm = backend.tensor_bridge.tensor_to_shm(pixels)
+
+            # Prepare parameters for bridge server
+            params = {
+                "model_id": vae.model_id,
+                "images_shm": images_shm,
+            }
+
+            # Call bridge server for vae_encode operation
+            logger.info("Calling bridge server for vae_encode...")
+
+            try:
+                response = backend._send_receive("vae_encode", params)
+
+                # Check response
+                if "latents_shm" not in response:
+                    raise RuntimeError(f"Bridge did not return latents_shm. Response keys: {list(response.keys())}")
+
+                # Deserialize latents from shared memory
+                latents = backend.tensor_bridge.tensor_from_shm(response["latents_shm"])
+
+                logger.info(f"Received latents: shape={latents.shape}, dtype={latents.dtype}")
+                logger.info(f"Latent value range: [{latents.min().item():.3f}, {latents.max().item():.3f}]")
+
+                # Return in ComfyUI LATENT format
+                # LATENT format: {"samples": tensor [B, C, H, W], "batch_index": [0, 1, ...]}
+                batch_size = latents.shape[0]
+                result = {
+                    "samples": latents,
+                    "batch_index": list(range(batch_size))
+                }
+
+                logger.info("=" * 80)
+                logger.info("TT_VAEENCODE - Complete! Latents ready for denoising")
+                logger.info("=" * 80)
+
+                return (result,)
+
+            finally:
+                # Clean up input shared memory
+                backend.tensor_bridge.cleanup_segment(images_shm["shm_name"])
+
+        except Exception as e:
+            logger.error(f"Error in TT_VAEEncode: {e}", exc_info=True)
+            raise RuntimeError(f"TT_VAEEncode failed: {e}")
