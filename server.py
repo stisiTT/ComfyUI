@@ -479,30 +479,37 @@ class PromptServer():
         async def view_image(request):
             if "filename" in request.rel_url.query:
                 filename = request.rel_url.query["filename"]
-                filename, output_dir = folder_paths.annotated_filepath(filename)
 
-                if not filename:
-                    return web.Response(status=400)
+                # If the filename is a blake3 hash, resolve it via the asset database
+                if filename.startswith("blake3:"):
+                    file, filename = self._resolve_blake3_to_path(filename)
+                    if file is None:
+                        return web.Response(status=404)
+                else:
+                    filename, output_dir = folder_paths.annotated_filepath(filename)
 
-                # validation for security: prevent accessing arbitrary path
-                if filename[0] == '/' or '..' in filename:
-                    return web.Response(status=400)
+                    if not filename:
+                        return web.Response(status=400)
 
-                if output_dir is None:
-                    type = request.rel_url.query.get("type", "output")
-                    output_dir = folder_paths.get_directory_by_type(type)
+                    # validation for security: prevent accessing arbitrary path
+                    if filename[0] == '/' or '..' in filename:
+                        return web.Response(status=400)
 
-                if output_dir is None:
-                    return web.Response(status=400)
+                    if output_dir is None:
+                        type = request.rel_url.query.get("type", "output")
+                        output_dir = folder_paths.get_directory_by_type(type)
 
-                if "subfolder" in request.rel_url.query:
-                    full_output_dir = os.path.join(output_dir, request.rel_url.query["subfolder"])
-                    if os.path.commonpath((os.path.abspath(full_output_dir), output_dir)) != output_dir:
-                        return web.Response(status=403)
-                    output_dir = full_output_dir
+                    if output_dir is None:
+                        return web.Response(status=400)
 
-                filename = os.path.basename(filename)
-                file = os.path.join(output_dir, filename)
+                    if "subfolder" in request.rel_url.query:
+                        full_output_dir = os.path.join(output_dir, request.rel_url.query["subfolder"])
+                        if os.path.commonpath((os.path.abspath(full_output_dir), output_dir)) != output_dir:
+                            return web.Response(status=403)
+                        output_dir = full_output_dir
+
+                    filename = os.path.basename(filename)
+                    file = os.path.join(output_dir, filename)
 
                 if os.path.isfile(file):
                     if 'preview' in request.rel_url.query:
@@ -994,6 +1001,31 @@ class PromptServer():
     async def setup(self):
         timeout = aiohttp.ClientTimeout(total=None) # no timeout
         self.client_session = aiohttp.ClientSession(timeout=timeout)
+
+    def _resolve_blake3_to_path(self, asset_hash: str) -> tuple[str | None, str]:
+        """Resolve a blake3 hash to an absolute file path via the asset database.
+
+        Returns (abs_path, display_filename) or (None, "") if not found.
+        """
+        from app.database.db import create_session
+        from app.assets.database.queries import get_asset_by_hash, list_references_by_asset_id
+        from app.assets.helpers import select_best_live_path
+
+        with create_session() as session:
+            asset = get_asset_by_hash(session, asset_hash)
+            if not asset:
+                return None, ""
+            refs = list_references_by_asset_id(session, asset_id=asset.id)
+            abs_path = select_best_live_path(refs)
+            if not abs_path:
+                return None, ""
+            display_name = os.path.basename(abs_path)
+            # Prefer the reference name if available
+            for ref in refs:
+                if ref.file_path == abs_path and ref.name:
+                    display_name = ref.name
+                    break
+            return abs_path, display_name
 
     def add_routes(self):
         self.user_manager.add_routes(self.routes)
