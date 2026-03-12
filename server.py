@@ -36,6 +36,7 @@ from comfy_api.internal import _ComfyNodeInternal
 from app.assets.seeder import asset_seeder
 from app.assets.api.routes import register_assets_routes
 from app.assets.services.ingest import register_file_in_place
+from app.assets.services.asset_management import resolve_hash_to_path
 
 from app.user_manager import UserManager
 from app.model_manager import ModelFileManager
@@ -164,11 +165,7 @@ def create_origin_only_middleware():
             if host_domain_parsed.port is None:
                 origin_domain = parsed.hostname
 
-            # When both host and origin are loopback, allow port differences
-            # (e.g. frontend dev server on :5173 proxying to backend on :8188)
-            if loopback and is_loopback(parsed.hostname):
-                pass
-            elif loopback and host_domain is not None and origin_domain is not None and len(host_domain) > 0 and len(origin_domain) > 0:
+            if loopback and host_domain is not None and origin_domain is not None and len(host_domain) > 0 and len(origin_domain) > 0:
                 if host_domain != origin_domain:
                     logging.warning("WARNING: request with non matching host and origin {} != {}, returning 403".format(host_domain, origin_domain))
                     return web.Response(status=403)
@@ -507,9 +504,10 @@ class PromptServer():
                 # node preview, it constructs /view?filename=<asset_hash>, so this
                 # endpoint must resolve blake3 hashes to their on-disk file paths.
                 if filename.startswith("blake3:"):
-                    file, filename = self._resolve_blake3_to_path(filename)
-                    if file is None:
+                    result = resolve_hash_to_path(filename)
+                    if result is None:
                         return web.Response(status=404)
+                    file, filename = result.abs_path, result.download_name
                 else:
                     filename, output_dir = folder_paths.annotated_filepath(filename)
 
@@ -1026,31 +1024,6 @@ class PromptServer():
     async def setup(self):
         timeout = aiohttp.ClientTimeout(total=None) # no timeout
         self.client_session = aiohttp.ClientSession(timeout=timeout)
-
-    def _resolve_blake3_to_path(self, asset_hash: str) -> tuple[str | None, str]:
-        """Resolve a blake3 hash to an absolute file path via the asset database.
-
-        Returns (abs_path, display_filename) or (None, "") if not found.
-        """
-        from app.database.db import create_session
-        from app.assets.database.queries import get_asset_by_hash, list_references_by_asset_id
-        from app.assets.helpers import select_best_live_path
-
-        with create_session() as session:
-            asset = get_asset_by_hash(session, asset_hash)
-            if not asset:
-                return None, ""
-            refs = list_references_by_asset_id(session, asset_id=asset.id)
-            abs_path = select_best_live_path(refs)
-            if not abs_path:
-                return None, ""
-            display_name = os.path.basename(abs_path)
-            # Prefer the reference name if available
-            for ref in refs:
-                if ref.file_path == abs_path and ref.name:
-                    display_name = ref.name
-                    break
-            return abs_path, display_name
 
     def add_routes(self):
         self.user_manager.add_routes(self.routes)
