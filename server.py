@@ -502,7 +502,10 @@ class PromptServer():
             if "filename" in request.rel_url.query:
                 filename = request.rel_url.query["filename"]
 
-                # If the filename is a blake3 hash, resolve it via the asset database
+                # The frontend's LoadImage combo widget uses asset_hash values
+                # (e.g. "blake3:...") as widget values. When litegraph renders the
+                # node preview, it constructs /view?filename=<asset_hash>, so this
+                # endpoint must resolve blake3 hashes to their on-disk file paths.
                 if filename.startswith("blake3:"):
                     file, filename = self._resolve_blake3_to_path(filename)
                     if file is None:
