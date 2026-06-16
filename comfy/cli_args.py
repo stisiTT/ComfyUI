@@ -76,6 +76,11 @@ fpvae_group.add_argument("--bf16-vae", action="store_true", help="Run the VAE in
 
 parser.add_argument("--cpu-vae", action="store_true", help="Run the VAE on the CPU.")
 
+parser.add_argument("--tenstorrent", action="store_true", help="Enable Tenstorrent hardware acceleration")
+parser.add_argument("--tt-server-url", type=str, default="http://127.0.0.1:8000", help="Base URL of the Tenstorrent tt-metal HTTP inference server")
+parser.add_argument("--tt-socket", type=str, default="/tmp/tt-comfy.sock", help="(Deprecated) Path to Tenstorrent bridge Unix socket")
+parser.add_argument("--tt-device", type=int, default=0, help="Tenstorrent device ID (0-31)")
+
 fpte_group = parser.add_mutually_exclusive_group()
 fpte_group.add_argument("--fp8_e4m3fn-text-enc", action="store_true", help="Store text encoder weights in fp8 (e4m3fn variant).")
 fpte_group.add_argument("--fp8_e5m2-text-enc", action="store_true", help="Store text encoder weights in fp8 (e5m2 variant).")
@@ -281,4 +286,4 @@ else:
 def enables_dynamic_vram():
     if args.enable_dynamic_vram:
         return True
-    return not args.disable_dynamic_vram and not args.highvram and not args.gpu_only and not args.novram and not args.cpu
+    return not args.disable_dynamic_vram and not args.highvram and not args.gpu_only and not args.novram and not args.cpu and not args.tenstorrent

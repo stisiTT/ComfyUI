@@ -52,6 +52,7 @@ class CPUState(Enum):
     GPU = 0
     CPU = 1
     MPS = 2
+    TENSTORRENT = 6
 
 # Determine VRAM State
 vram_state = VRAMState.NORMAL_VRAM
@@ -156,6 +157,10 @@ except:
 if args.cpu:
     cpu_state = CPUState.CPU
 
+if args.tenstorrent:
+    cpu_state = CPUState.TENSTORRENT
+    logging.info("Tenstorrent mode enabled - using CPU for orchestration")
+
 def is_intel_xpu():
     global cpu_state
     global xpu_available
@@ -182,6 +187,24 @@ def is_ixuca():
         return True
     return False
 
+def is_tenstorrent_device(device):
+    """Check if device is Tenstorrent hardware."""
+    if isinstance(device, str):
+        return device.lower() in ('tenstorrent', 'tt')
+    return False
+
+def get_tenstorrent_backend():
+    """Get Tenstorrent backend singleton."""
+    try:
+        from comfy.backends.tenstorrent_backend import get_backend
+        return get_backend()
+    except ImportError as e:
+        logging.warning(f"Tenstorrent backend not available: {e}")
+        return None
+    except Exception as e:
+        logging.warning(f"Failed to initialize Tenstorrent backend: {e}")
+        return None
+
 def is_wsl():
     version = platform.uname().release
     if version.endswith("-Microsoft"):
@@ -200,6 +223,8 @@ def get_torch_device():
         return torch.device("mps")
     if cpu_state == CPUState.CPU:
         return torch.device("cpu")
+    if cpu_state == CPUState.TENSTORRENT:
+        return torch.device("cpu")  # TT backend uses CPU for tensor orchestration
     else:
         if is_intel_xpu():
             return torch.device("xpu", torch.xpu.current_device())
@@ -208,7 +233,11 @@ def get_torch_device():
         elif is_mlu():
             return torch.device("mlu", torch.mlu.current_device())
         else:
-            return torch.device(torch.cuda.current_device())
+            if torch.cuda.is_available():
+                return torch.device(torch.cuda.current_device())
+            else:
+                logging.warning("CUDA not available, falling back to CPU")
+                return torch.device("cpu")
 
 def get_all_torch_devices(exclude_current=False):
     global cpu_state
@@ -1698,7 +1727,7 @@ def get_free_memory(dev=None, torch_free_too=False):
 
 def cpu_mode():
     global cpu_state
-    return cpu_state == CPUState.CPU
+    return cpu_state in (CPUState.CPU, CPUState.TENSTORRENT)
 
 def mps_mode():
     global cpu_state

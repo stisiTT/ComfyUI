@@ -35,3 +35,13 @@ pydantic~=2.0
 pydantic-settings~=2.0
 PyOpenGL
 glfw
+
+msgpack>=1.0.0
+
+# Tenstorrent board reset (TT Kill Server node, reset_board option).
+# Native/Rust-backed; pinned to match tt-smi (see tt-smi/pyproject.toml).
+# Used in-process by custom_nodes/tenstorrent_nodes/server_manager.reset_all_boards().
+tt-smi
+pyluwen~=0.8.0
+tt-umd==0.9.3
+tt_tools_common~=1.6.0
