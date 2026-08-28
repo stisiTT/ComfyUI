@@ -5,8 +5,11 @@ __pycache__/
 !/input/example.png
 /models/
 /temp/
-/custom_nodes/
+/custom_nodes/*
 !custom_nodes/example_node.py.example
+# The Tenstorrent nodes live in-tree; without this every new file under them
+# (docs especially) is silently ignored and never reaches the remote.
+!/custom_nodes/tenstorrent_nodes/
 extra_model_paths.yaml
 /.vs
 .vscode/
